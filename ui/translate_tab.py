@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 from ocr import ocr_vi_layout
 from ui.pdf_renderer import export_layout_pdf
+import json
 
 class TranslateTab(QWidget):
     def __init__(self):
@@ -57,10 +58,64 @@ class TranslateTab(QWidget):
         self.en_edit.clear()
 
     def _run_ocr(self):
+        """
+        Chạy OCR trên ảnh hiện tại, ghi:
+          • <tên>_boxes.json   – danh sách block (từng từ) + toạ-độ
+          • <tên>_vi.txt       – văn bản tiếng Việt đã GHÉP theo dòng
+        Sau khi xong, text được đổ vào self.vi_edit.
+        """
         if not self.img_path:
             return
         self._set_btns(False)
-        w = CallableWorker(ocr_vi, self.img_path)
+
+        def do_ocr():
+            # --- 1. Gọi Google Vision để lấy blocks (từng từ) ---
+            from ocr import ocr_vi_layout            # tránh import vòng lặp
+            blocks, img_size = ocr_vi_layout(self.img_path)
+            img_w, img_h = img_size
+
+            # --- 2. Gom các *từ* thành *dòng* dựa vào toạ-độ Y ---
+            # Sắp xếp theo (y, x) để bảo đảm đọc từ trên xuống – trái qua phải
+            blocks_sorted = sorted(
+                blocks, key=lambda b: (b["box"][1], b["box"][0])
+            )
+
+            line_thresh = max(10, int(img_h * 0.015))  # ~1.5 % chiều cao ảnh
+            lines, cur_line, cur_y = [], [], None
+
+            for blk in blocks_sorted:
+                y_top = blk["box"][1]
+                if cur_y is None or abs(y_top - cur_y) <= line_thresh:
+                    # Vẫn cùng một dòng
+                    cur_line.append(blk["text"].strip())
+                    cur_y = y_top if cur_y is None else cur_y
+                else:
+                    # Sang dòng mới
+                    lines.append(" ".join(cur_line))
+                    cur_line = [blk["text"].strip()]
+                    cur_y = y_top
+            if cur_line:
+                lines.append(" ".join(cur_line))
+
+            vi_text = "\n".join(lines)
+
+            # --- 3. Ghi file boxes.json & vi.txt ---
+            base = self.img_path.with_suffix("")
+            box_path = base.with_name(f"{base.name}_boxes.json")
+            vi_path  = base.with_name(f"{base.name}_{CONFIG.vi_filename}")
+
+            import json, logging
+            box_path.write_text(
+                json.dumps(blocks, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            vi_path.write_text(vi_text, encoding="utf-8")
+            logging.info("Saved OCR to %s  &  %s", box_path, vi_path)
+
+            return vi_text     # Trả về cho signal .done
+
+        # --- 4. Đẩy job sang thread nền ---
+        w = CallableWorker(do_ocr)
         w.sig.done.connect(self._on_ocr_done)
         w.sig.error.connect(self._on_error)
         self.pool.start(w)
@@ -88,9 +143,9 @@ class TranslateTab(QWidget):
         logging.info("Saved texts alongside image")
 
         # Lưu file PDF tiếng Anh
-        pdf_path = base.with_suffix(".translated.pdf")
-        export_translated_pdf(en_text, pdf_path)
-        logging.info("Exported translated PDF to %s", pdf_path)
+        # pdf_path = base.with_suffix(".translated.pdf")
+        # export_translated_pdf(en_text, pdf_path)
+        # logging.info("Exported translated PDF to %s", pdf_path)
 
     def _on_ocr_done(self, text: str):
         self.vi_edit.setPlainText(text)
@@ -117,21 +172,36 @@ class TranslateTab(QWidget):
         self._set_btns(False)
 
         try:
-            # Bước 1: OCR layout
-            blocks, img_size = ocr_vi_layout(self.img_path)
+            base = self.img_path.with_suffix("")
+            box_path = base.with_name(base.name + "_boxes.json")
+            en_path = base.with_name(base.name + "_" + CONFIG.en_filename)
 
-            # Bước 2: Translate từng block
-            for blk in blocks:
-                blk["text_en"] = translate_vi2en(blk["text"])
+            if not box_path.exists() or not en_path.exists():
+                QMessageBox.critical(self, "Error", "Missing boxes or translation files. Please run OCR and Save first.")
+                return
 
-            # Bước 3: Export layout PDF
+            # Đọc lại hộp và bản dịch
+            blocks = json.loads(box_path.read_text(encoding="utf-8"))
+            en_lines = en_path.read_text(encoding="utf-8").splitlines()
+
+            # Ánh xạ từng dòng dịch vào từng block
+            for blk, trans in zip(blocks, en_lines):
+                blk["text_en"] = trans.strip()
+
+            # Lấy kích thước ảnh từ ảnh gốc
+            img = QPixmap(str(self.img_path))
+            img_size = (img.width(), img.height())
+
+            # Gọi render PDF
             pdf_path = self.img_path.with_suffix(".layout.pdf")
             export_layout_pdf(blocks, img_size, pdf_path)
+
             logging.info("Exported layout PDF to %s", pdf_path)
             QMessageBox.information(self, "Done", f"Saved to:\n{pdf_path}")
 
         except Exception as e:
             logging.error("Layout PDF export failed: %s", e)
             QMessageBox.critical(self, "Error", str(e))
+
         finally:
             self._set_btns(True)

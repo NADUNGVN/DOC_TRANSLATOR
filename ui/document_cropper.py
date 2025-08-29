@@ -1,83 +1,74 @@
+# document_cropper.py
 import cv2
 import numpy as np
+import matplotlib.pyplot as plt
 
-def order_points(pts):
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
+A4_PX_PORTRAIT  = (2480, 3508)   # 210×297 mm @300 dpi  (w, h)
+A4_PX_LANDSCAPE = (3508, 2480)   # hoán đổi khi trang xoay ngang
+
+def _order_points(pts: np.ndarray) -> np.ndarray:
+    """Trả về 4 điểm theo thứ tự TL, TR, BR, BL."""
+    s   = pts.sum(axis=1)
     diff = np.diff(pts, axis=1)
+    return np.array([
+        pts[np.argmin(s)],          # TL
+        pts[np.argmin(diff)],       # TR
+        pts[np.argmax(s)],          # BR
+        pts[np.argmax(diff)],       # BL
+    ], dtype=np.float32)
 
-    rect[0] = pts[np.argmin(s)]      # top-left
-    rect[2] = pts[np.argmax(s)]      # bottom-right
-    rect[1] = pts[np.argmin(diff)]   # top-right
-    rect[3] = pts[np.argmax(diff)]   # bottom-left
-    return rect
+def rectify_to_a4(img_bgr, debug=False):
+    """
+    Tìm khung giấy A4, warp về đúng tỉ lệ.
+    Trả về: warped_img (np.ndarray), homography H (3×3)
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    edges = cv2.Canny(blur, 50, 150)
 
-def four_point_transform(image, pts):
-    rect = order_points(pts)
-    (tl, tr, br, bl) = rect
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    img_area = img_bgr.shape[0] * img_bgr.shape[1]
+    doc_cnt  = None
+    max_area = 0
 
-    widthA = np.linalg.norm(br - bl)
-    widthB = np.linalg.norm(tr - tl)
-    maxWidth = int(max(widthA, widthB))
+    for c in cnts:
+        peri  = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        area   = cv2.contourArea(approx)
+        if len(approx) == 4 and area > max_area and area > 0.3 * img_area:
+            doc_cnt, max_area = approx, area
 
+    if doc_cnt is None:
+        raise RuntimeError("Không tìm được contour 4 góc đủ lớn của trang")
+
+    ordered = _order_points(doc_cnt.reshape(4, 2).astype(np.float32))
+
+    # Xác định trang đang portrait hay landscape
+    (tl, tr, br, bl) = ordered
+    widthA  = np.linalg.norm(br - bl)
+    widthB  = np.linalg.norm(tr - tl)
     heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
-    maxHeight = int(max(heightA, heightB))
 
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]
-    ], dtype="float32")
+    avg_w = (widthA + widthB) / 2
+    avg_h = (heightA + heightB) / 2
 
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-    return warped
+    if avg_w > avg_h:                 # trang xoay ngang
+        w, h = A4_PX_LANDSCAPE
+    else:
+        w, h = A4_PX_PORTRAIT
 
-def detect_and_crop_document(image):
-    orig = image.copy()
-    ratio = image.shape[0] / 500.0
-    image = cv2.resize(image, (int(image.shape[1] / ratio), 500))
+    dest = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]],
+                    dtype=np.float32)
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    H = cv2.getPerspectiveTransform(ordered, dest)
+    warped = cv2.warpPerspective(img_bgr, H, (w, h))
 
-    # Adaptive threshold to highlight document edge
-    thresh = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY_INV,
-        11, 10
-    )
+    if debug:
+        dbg = img_bgr.copy()
+        cv2.drawContours(dbg, [doc_cnt], -1, (0, 255, 0), 3)
+        plt.subplot(1, 2, 1); plt.imshow(cv2.cvtColor(dbg, cv2.COLOR_BGR2RGB)); plt.title("Contour")
+        plt.subplot(1, 2, 2); plt.imshow(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)); plt.title("Warped")
+        plt.show()
 
-    # Morph to close gaps in edge
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < 0.1 * image.shape[0] * image.shape[1]:
-            continue
-
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-
-        if len(approx) == 4:
-            doc_pts = approx.reshape(4, 2) * ratio
-            print("[Cropper] ✅ Found 4-point contour")
-            return four_point_transform(orig, doc_pts)
-
-        # fallback: dùng minAreaRect
-        if len(approx) >= 4:
-            rect = cv2.minAreaRect(c)
-            box = cv2.boxPoints(rect)
-            box = np.intp(box)
-            print("[Cropper] ⚠️ Using minAreaRect fallback")
-            return four_point_transform(orig, box * ratio)
-
-    print("[Cropper] ❌ No document found, return original image")
-    return orig
+    return warped, H
