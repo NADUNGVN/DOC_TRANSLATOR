@@ -7,6 +7,8 @@ from datetime import datetime
 import cv2
 import logging
 from config import CONFIG
+from ui.document_cropper import detect_and_crop_document
+
 
 class CaptureTab(QWidget):
     def __init__(self, on_captured):
@@ -99,6 +101,8 @@ class CaptureTab(QWidget):
         if not ret:
             return
         frame = self._apply_rotation(frame)
+        # 👉 CROP tự động giấy tờ
+        frame = detect_and_crop_document(frame)
 
         # Tạo thư mục captures nếu chưa tồn tại
         capture_dir = Path.cwd() / "captures"
@@ -109,6 +113,7 @@ class CaptureTab(QWidget):
         cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, CONFIG.jpeg_quality])
         logging.info("Saved %s", path)
         self.on_captured(path)
+        cv2.imwrite("debug_crop.jpg", frame)
 
     def closeEvent(self, e):
         self.cap.release()

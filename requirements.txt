@@ -4,3 +4,4 @@ python-dotenv
 google-cloud-vision
 google-auth
 groq
+reportlab
