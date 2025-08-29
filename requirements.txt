@@ -1,0 +1,6 @@
+PyQt5
+opencv-python
+python-dotenv
+google-cloud-vision
+google-auth
+groq
