@@ -1,7 +1,7 @@
 from PyQt5.QtCore import QObject, pyqtSignal, QRunnable
 
 class WorkerSignals(QObject):
-    done = pyqtSignal(str)
+    done = pyqtSignal(object)
     error = pyqtSignal(str)
 
 class CallableWorker(QRunnable):
